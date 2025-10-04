@@ -1,5 +1,4 @@
-/*
- * pa1.c
+/* pa1.c
  * Rewritten to follow the student's implementation plan.
  * Features implemented in this file:
  * - Data structures for Node, Inverter, and Wire (Step 1)
@@ -9,10 +8,20 @@
  * - Pre-order / post-order printers and binary writers (Step 5)
  * - A stub for inverter insertion (Step 6) — greedy algorithm to be implemented next
  *
- * This version produces Output #1 (pre-order) and Output #2 (binary elmore).
- * Output #3 and #4 (topology with inverters) remain unimplemented and are
- * left as empty files; in that case the program returns EXIT_FAILURE as
- * permitted by the assignment when no inverter insertion is produced.
+/*
+ * pa1.c
+ * Rewritten to follow the student's implementation plan.
+ * Features implemented in this file:
+ * - Data structures for Node, Inverter, and Wire
+ * - Parsing functions for inverter, wire, and post-order tree
+ * - RC parameter computations
+ * - Elmore delay computation (node-sum formula)
+ * - Pre-order and post-order topology writers
+ * - Greedy inverter insertion and parity fix (no wire-splitting)
+ *
+ * The file focuses on correctness and robustness of the core algorithm. It
+ * intentionally does not implement wire-splitting repeaters (that is a
+ * larger feature) and keeps the greedy insertion policy simple.
  */
 
 #include <stdio.h>
@@ -169,12 +178,7 @@ static void write_preorder_topology(FILE *f, Node *n) {
 }
 
 /* create empty file (truncate) */
-static int create_empty_file(const char *path) {
-    FILE *f = fopen(path, "wb");
-    if (!f) return -1;
-    fclose(f);
-    return 0;
-}
+/* removed unused helper create_empty_file to reduce dead code */
 
 /* context for leaf writer */
 struct cb_ctx { FILE *fel; Node *root; const Wire *wire; double Rb; /* inverter driver Cout to include in leaf delays */ double inv_Cout; Node **all_nodes; size_t all_count; };
@@ -192,6 +196,7 @@ static Node *lca(Node *a, Node *b) {
     Node **anc = malloc(cap * sizeof(Node*));
     while (cur) {
         if (sz == cap) { cap *= 2; anc = realloc(anc, cap * sizeof(Node*)); }
+        if (!anc) { fprintf(stderr, "memory allocation failure\n"); return NULL; }
         anc[sz++] = cur;
         cur = cur->parent;
     }
@@ -238,7 +243,9 @@ static void collect_nodes_pre(Node ***allp, size_t *cntp, size_t *allocp, Node *
     if (!n) return;
     if (*cntp == *allocp) {
         *allocp = (*allocp == 0) ? 64 : (*allocp * 2);
-        *allp = realloc(*allp, (*allocp) * sizeof(Node*));
+        Node **tmp = realloc(*allp, (*allocp) * sizeof(Node*));
+        if (!tmp) { fprintf(stderr, "memory allocation failure\n"); exit(EXIT_FAILURE); }
+        *allp = tmp;
     }
     (*allp)[(*cntp)++] = n;
     collect_nodes_pre(allp, cntp, allocp, n->left);
@@ -289,6 +296,7 @@ static double elmore_from_driver(Node *drv_node, const Wire *wire, const Inverte
     Node **stack = NULL; size_t sz = 0, cap = 0;
     /* push drv_node */
     cap = 16; stack = malloc(cap * sizeof(Node*)); stack[sz++] = drv_node;
+    if (!stack) { fprintf(stderr, "memory allocation failure\n"); return -1.0; }
     while (sz) {
         Node *n = stack[--sz];
         if (n->is_leaf) {
@@ -298,8 +306,24 @@ static double elmore_from_driver(Node *drv_node, const Wire *wire, const Inverte
             if (delay > max_delay) { max_delay = delay; worst = n; }
             continue;
         }
-        if (n->right) { if (sz == cap) { cap *= 2; stack = realloc(stack, cap * sizeof(Node*)); } stack[sz++] = n->right; }
-        if (n->left)  { if (sz == cap) { cap *= 2; stack = realloc(stack, cap * sizeof(Node*)); } stack[sz++] = n->left; }
+        if (n->right) {
+            if (sz == cap) {
+                cap *= 2;
+                Node **tmp = realloc(stack, cap * sizeof(Node*));
+                if (!tmp) { free(stack); fprintf(stderr, "memory allocation failure\n"); return -1.0; }
+                stack = tmp;
+            }
+            stack[sz++] = n->right;
+        }
+        if (n->left) {
+            if (sz == cap) {
+                cap *= 2;
+                Node **tmp = realloc(stack, cap * sizeof(Node*));
+                if (!tmp) { free(stack); fprintf(stderr, "memory allocation failure\n"); return -1.0; }
+                stack = tmp;
+            }
+            stack[sz++] = n->left;
+        }
     }
     free(stack);
     if (worst_leaf_out) *worst_leaf_out = worst;
@@ -315,8 +339,7 @@ static void greedy_insert_inverters(Node *root, const Wire *wire, const Inverter
 
     /* driver worklist: simple dynamic array of nodes to check */
     Node **drivers = NULL; size_t dcnt = 0, dcap = 0;
-    auto_add_driver:;
-    if (dcnt == dcap) { dcap = dcap ? dcap*2 : 16; drivers = realloc(drivers, dcap * sizeof(Node*)); }
+    if (dcnt == dcap) { dcap = dcap ? dcap*2 : 16; Node **tmp = realloc(drivers, dcap * sizeof(Node*)); if (!tmp) { fprintf(stderr, "memory allocation failure\n"); return; } drivers = tmp; }
     drivers[dcnt++] = root;
 
     for (size_t di = 0; di < dcnt; ++di) {
@@ -330,8 +353,8 @@ static void greedy_insert_inverters(Node *root, const Wire *wire, const Inverter
         /* insert one inverter at child (increase parallel count) */
         child->num_inverters += 1;
         /* add child as a driver to be processed */
-        if (dcnt == dcap) { dcap = dcap ? dcap*2 : 16; drivers = realloc(drivers, dcap * sizeof(Node*)); }
-        drivers[dcnt++] = child;
+    if (dcnt == dcap) { dcap = dcap ? dcap*2 : 16; Node **tmp = realloc(drivers, dcap * sizeof(Node*)); if (!tmp) { free(drivers); fprintf(stderr, "memory allocation failure\n"); return; } drivers = tmp; }
+    drivers[dcnt++] = child;
         /* continue loop; the newly added driver will be processed later */
     }
     free(drivers);
@@ -346,7 +369,9 @@ static void parity_fix(Node *root) {
     if (!root) return;
     /* collect leaves by traversal */
     Node **stack = NULL; size_t sz = 0, cap = 0;
-    cap = 32; stack = malloc(cap * sizeof(Node*)); stack[sz++] = root;
+    cap = 32; stack = malloc(cap * sizeof(Node*));
+    if (!stack) { fprintf(stderr, "memory allocation failure\n"); return; }
+    stack[sz++] = root;
     while (sz) {
         Node *n = stack[--sz];
         if (n->is_leaf) {
@@ -363,8 +388,24 @@ static void parity_fix(Node *root) {
             }
             continue;
         }
-        if (n->right) { if (sz == cap) { cap *= 2; stack = realloc(stack, cap * sizeof(Node*)); } stack[sz++] = n->right; }
-        if (n->left)  { if (sz == cap) { cap *= 2; stack = realloc(stack, cap * sizeof(Node*)); } stack[sz++] = n->left; }
+        if (n->right) {
+            if (sz == cap) {
+                cap *= 2;
+                Node **tmp = realloc(stack, cap * sizeof(Node*));
+                if (!tmp) { free(stack); fprintf(stderr, "memory allocation failure\n"); return; }
+                stack = tmp;
+            }
+            stack[sz++] = n->right;
+        }
+        if (n->left) {
+            if (sz == cap) {
+                cap *= 2;
+                Node **tmp = realloc(stack, cap * sizeof(Node*));
+                if (!tmp) { free(stack); fprintf(stderr, "memory allocation failure\n"); return; }
+                stack = tmp;
+            }
+            stack[sz++] = n->left;
+        }
     }
     free(stack);
 }
