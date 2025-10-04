@@ -177,7 +177,7 @@ static int create_empty_file(const char *path) {
 }
 
 /* context for leaf writer */
-struct cb_ctx { FILE *fel; Node *root; const Wire *wire; double Rb; Node **all_nodes; size_t all_count; };
+struct cb_ctx { FILE *fel; Node *root; const Wire *wire; double Rb; /* inverter driver Cout to include in leaf delays */ double inv_Cout; Node **all_nodes; size_t all_count; };
 
 /* helper: compute LCA by walking ancestors of a and marking in an array
  * We implement a simple path-based LCA without extra memory by building
@@ -221,6 +221,13 @@ static void leaf_writer(Node *leaf, void *vctx) {
         if (!L) continue;
         delay += ci * L->Rroot;
     }
+    /* include driver's output capacitance at the root as an extra c' term
+     * multiplied by Rroot(root). Treat the driver as having at least one
+     * stage (implicit) when computing effective Cout for the pre-output.
+     */
+    double root_k = (double)(c->root->num_inverters ? c->root->num_inverters : 1);
+    double Cout_eff = c->inv_Cout * root_k;
+    delay += Cout_eff * c->root->Rroot;
     /* write label (int) then double */
     fwrite(&leaf->label, sizeof(int), 1, c->fel);
     fwrite(&delay, sizeof(double), 1, c->fel);
@@ -249,6 +256,150 @@ static void set_Rroot_recursive(Node *n, const Wire *wire) {
         n->right->Rroot = n->Rroot + wire->r * n->wire_right;
         set_Rroot_recursive(n->right, wire);
     }
+}
+
+/* find first child of ancestor "from" on the path to node "to" */
+static Node *first_child_on_path(Node *from, Node *to) {
+    /* walk up from 'to' to find the node whose parent is 'from' */
+    Node *p = to;
+    Node *prev = NULL;
+    while (p && p != from) { prev = p; p = p->parent; }
+    if (p == from) return prev; /* prev is immediate child of from on path */
+    return NULL;
+}
+
+/* Compute Elmore delays from driver node "drv_node" to every leaf in its subtree.
+ * Returns max delay and sets worst_leaf_out. Uses inv params and wire.
+ */
+static double elmore_from_driver(Node *drv_node, const Wire *wire, const Inverter *inv, Node **worst_leaf_out) {
+    double max_delay = -1.0;
+    Node *worst = NULL;
+    /* determine effective Rb and Cout at this driver based on num_inverters */
+    int k = drv_node->num_inverters > 0 ? drv_node->num_inverters : 1; /* at least 1 when used as driver */
+    double Rb_eff = inv->Rb / (double)k;
+    double Cout_eff = inv->Cout * (double)k;
+
+    /* driver_total_cap is drv_node->subtree_c plus driver output cap */
+    double driver_total_c = drv_node->subtree_c + Cout_eff;
+
+    /* For each leaf in subtree, compute delay = Rb_eff * driver_total_c + sum_edges Redge * subtree_c(child)
+     * We'll traverse subtree and collect leaves.
+     */
+    /* simple stack traversal */
+    Node **stack = NULL; size_t sz = 0, cap = 0;
+    /* push drv_node */
+    cap = 16; stack = malloc(cap * sizeof(Node*)); stack[sz++] = drv_node;
+    while (sz) {
+        Node *n = stack[--sz];
+        if (n->is_leaf) {
+            double delay = Rb_eff * driver_total_c;
+            /* add edge contributions along path from drv_node to this leaf */
+            add_path_contributions(drv_node, n, wire, &delay);
+            if (delay > max_delay) { max_delay = delay; worst = n; }
+            continue;
+        }
+        if (n->right) { if (sz == cap) { cap *= 2; stack = realloc(stack, cap * sizeof(Node*)); } stack[sz++] = n->right; }
+        if (n->left)  { if (sz == cap) { cap *= 2; stack = realloc(stack, cap * sizeof(Node*)); } stack[sz++] = n->left; }
+    }
+    free(stack);
+    if (worst_leaf_out) *worst_leaf_out = worst;
+    return max_delay;
+}
+
+/* Greedy inverter insertion top-down: insert inverter at offending child of driver until all stage delays <= constraint.
+ * This places inverters at existing internal nodes (no wire splitting). It increments num_inverters at a node when inserting.
+ */
+static void greedy_insert_inverters(Node *root, const Wire *wire, const Inverter *inv, double constraint) {
+    /* ensure root has one implicit driver */
+    if (root->num_inverters == 0) root->num_inverters = 1;
+
+    /* driver worklist: simple dynamic array of nodes to check */
+    Node **drivers = NULL; size_t dcnt = 0, dcap = 0;
+    auto_add_driver:;
+    if (dcnt == dcap) { dcap = dcap ? dcap*2 : 16; drivers = realloc(drivers, dcap * sizeof(Node*)); }
+    drivers[dcnt++] = root;
+
+    for (size_t di = 0; di < dcnt; ++di) {
+        Node *drv = drivers[di];
+        Node *worst = NULL;
+        double maxd = elmore_from_driver(drv, wire, inv, &worst);
+        if (maxd <= constraint) continue;
+        /* find child of drv on path to worst leaf */
+        Node *child = first_child_on_path(drv, worst);
+        if (!child) continue; /* shouldn't happen */
+        /* insert one inverter at child (increase parallel count) */
+        child->num_inverters += 1;
+        /* add child as a driver to be processed */
+        if (dcnt == dcap) { dcap = dcap ? dcap*2 : 16; drivers = realloc(drivers, dcap * sizeof(Node*)); }
+        drivers[dcnt++] = child;
+        /* continue loop; the newly added driver will be processed later */
+    }
+    free(drivers);
+}
+
+/* Ensure every leaf is non-inverting: total number of inverters along path (including root implicit) must be even.
+ * Root counts as 1 stage (implicit driver). So we require (1 + sum(num_inverters on path)) % 2 == 0 => sum %2 == 1.
+ * If a leaf path has wrong parity, insert one inverter at its parent.
+ */
+static void parity_fix(Node *root) {
+    /* traverse all leaves */
+    if (!root) return;
+    /* collect leaves by traversal */
+    Node **stack = NULL; size_t sz = 0, cap = 0;
+    cap = 32; stack = malloc(cap * sizeof(Node*)); stack[sz++] = root;
+    while (sz) {
+        Node *n = stack[--sz];
+        if (n->is_leaf) {
+            /* compute sum num_inverters along path from root (excluding root?) include root->num_inverters? We consider root implicit 1 and num_inverters recorded there as well. We define total_inverters = sum over nodes on path of num_inverters; currently root.num_inverters includes implicit driver (1). */
+            int sum = 0;
+            Node *p = n;
+            while (p) { sum += p->num_inverters; p = p->parent; }
+            /* total number of inverters along path is sum; we need total to be even -> sum %2 == 0 */
+            if ((sum % 2) != 0) {
+                /* sum is odd -> total inverters odd -> leaf would be inverting. We need even -> insert one inverter at parent of leaf */
+                Node *par = n->parent;
+                if (par) par->num_inverters += 1;
+                else n->num_inverters += 1; /* if leaf is root (degenerate), insert here */
+            }
+            continue;
+        }
+        if (n->right) { if (sz == cap) { cap *= 2; stack = realloc(stack, cap * sizeof(Node*)); } stack[sz++] = n->right; }
+        if (n->left)  { if (sz == cap) { cap *= 2; stack = realloc(stack, cap * sizeof(Node*)); } stack[sz++] = n->left; }
+    }
+    free(stack);
+}
+
+/* post-order print topology with inverter counts: internal nodes printed as (lenL lenR k)
+ * Leaves printed as label(cap). This matches output #3 format.
+ */
+static void write_postorder_topology(FILE *f, Node *n) {
+    if (!n) return;
+    if (n->is_leaf) {
+        fprintf(f, "%d(%.10le)\n", n->label, n->cap);
+        return;
+    }
+    write_postorder_topology(f, n->left);
+    write_postorder_topology(f, n->right);
+    /* print node with its inverter count */
+    fprintf(f, "(%.10le %.10le %d)\n", n->wire_left, n->wire_right, n->num_inverters);
+}
+
+/* binary post-order topology writer: leaf => int label, double cap; internal => int -1, double lenL, double lenR, int k */
+static void write_postorder_topology_binary(FILE *f, Node *n) {
+    if (!n) return;
+    if (n->is_leaf) {
+        int lab = n->label;
+        fwrite(&lab, sizeof(int), 1, f);
+        fwrite(&n->cap, sizeof(double), 1, f);
+        return;
+    }
+    write_postorder_topology_binary(f, n->left);
+    write_postorder_topology_binary(f, n->right);
+    int marker = -1;
+    fwrite(&marker, sizeof(int), 1, f);
+    fwrite(&n->wire_left, sizeof(double), 1, f);
+    fwrite(&n->wire_right, sizeof(double), 1, f);
+    fwrite(&n->num_inverters, sizeof(int), 1, f);
 }
 
 
@@ -377,13 +528,24 @@ int main(int argc, char **argv) {
     free(all);
     fclose(fel);
 
-    /* For this minimal implementation we do not attempt to insert inverters.
-     * Create/truncate the requested inverter output files as empty files and
-     * return EXIT_FAILURE (per assignment instructions this is acceptable).
-     */
-    create_empty_file(ttopo_out);
-    create_empty_file(btopo_out);
+    /* Now perform inverter insertion (greedy) using the time constraint */
+    greedy_insert_inverters(root, &wire, &inv, time_constraint);
+    parity_fix(root);
+
+    /* Write post-order topology text and binary files */
+    FILE *ftt = fopen(ttopo_out, "w");
+    FILE *fbt = fopen(btopo_out, "wb");
+    if (!ftt || !fbt) {
+        if (ftt) fclose(ftt);
+        if (fbt) fclose(fbt);
+        /* leave them empty if we couldn't open */
+        free_tree(root);
+        return EXIT_FAILURE;
+    }
+    write_postorder_topology(ftt, root);
+    write_postorder_topology_binary(fbt, root);
+    fclose(ftt); fclose(fbt);
 
     free_tree(root);
-    return EXIT_FAILURE;
+    return EXIT_SUCCESS;
 }
