@@ -129,6 +129,15 @@ static void compute_cprimes(Node *n, const Wire *wire, const Inverter *drv) {
     n->subtree_c = cp + (n->left ? n->left->subtree_c : 0.0) + (n->right ? n->right->subtree_c : 0.0);
 }
 
+    /* count total number of inverters placed in the tree */
+    static int count_total_inverters(Node *n) {
+        if (!n) return 0;
+        int sum = n->num_inverters;
+        sum += count_total_inverters(n->left);
+        sum += count_total_inverters(n->right);
+        return sum;
+    }
+
 /* add edge contributions along path: helper that searches for target leaf and
  * accumulates R_edge * subtree_c(child) when unwinding. Returns 1 if found. */
 /* Add edge contributions R(u,v) * sum_{k in T_v} c'_k for each edge on the
@@ -339,14 +348,17 @@ static double elmore_from_driver(Node *drv_node, const Wire *wire, const Inverte
 /* Greedy inverter insertion top-down: insert inverter at offending child of driver until all stage delays <= constraint.
  * This places inverters at existing internal nodes (no wire splitting). It increments num_inverters at a node when inserting.
  */
-static void greedy_insert_inverters(Node *root, const Wire *wire, const Inverter *inv, double constraint) {
+static int greedy_insert_inverters(Node *root, const Wire *wire, const Inverter *inv, double constraint) {
     /* ensure root has one implicit driver */
     if (root->num_inverters == 0) root->num_inverters = 1;
 
     /* driver worklist: simple dynamic array of nodes to check */
     Node **drivers = NULL; size_t dcnt = 0, dcap = 0;
-    if (dcnt == dcap) { dcap = dcap ? dcap*2 : 16; Node **tmp = realloc(drivers, dcap * sizeof(Node*)); if (!tmp) { fprintf(stderr, "memory allocation failure\n"); return; } drivers = tmp; }
+    /* ensure initial allocation */
+    dcap = 16; drivers = malloc(dcap * sizeof(Node*));
+    if (!drivers) { fprintf(stderr, "memory allocation failure\n"); return 0; }
     drivers[dcnt++] = root;
+    int inserted = 0;
 
     for (size_t di = 0; di < dcnt; ++di) {
         Node *drv = drivers[di];
@@ -358,62 +370,95 @@ static void greedy_insert_inverters(Node *root, const Wire *wire, const Inverter
         if (!child) continue; /* shouldn't happen */
         /* insert one inverter at child (increase parallel count) */
         child->num_inverters += 1;
+        inserted += 1;
         /* add child as a driver to be processed */
-    if (dcnt == dcap) { dcap = dcap ? dcap*2 : 16; Node **tmp = realloc(drivers, dcap * sizeof(Node*)); if (!tmp) { free(drivers); fprintf(stderr, "memory allocation failure\n"); return; } drivers = tmp; }
-    drivers[dcnt++] = child;
+        if (dcnt == dcap) {
+            size_t ncap = dcap * 2;
+            Node **tmp = realloc(drivers, ncap * sizeof(Node*));
+            if (!tmp) { free(drivers); fprintf(stderr, "memory allocation failure\n"); return inserted; }
+            drivers = tmp; dcap = ncap;
+        }
+        drivers[dcnt++] = child;
         /* continue loop; the newly added driver will be processed later */
     }
     free(drivers);
+    return inserted;
 }
 
+    /* iterate greedy insertion + parity fix until no change in total inverter count */
+    static int iterate_insertion_until_converged(Node *root, const Wire *wire, const Inverter *inv, double constraint) {
+        const int MAX_ITERS = 64;
+        for (int it = 0; it < MAX_ITERS; ++it) {
+            int before = count_total_inverters(root);
+            greedy_insert_inverters(root, wire, inv, constraint);
+            parity_fix(root);
+            int after = count_total_inverters(root);
+            if (after == before) return 0; /* converged */
+        }
+        return 1; /* reached iteration limit */
+    }
 /* Ensure every leaf is non-inverting: total number of inverters along path (including root implicit) must be even.
  * Root counts as 1 stage (implicit driver). So we require (1 + sum(num_inverters on path)) % 2 == 0 => sum %2 == 1.
  * If a leaf path has wrong parity, insert one inverter at its parent.
  */
-static void parity_fix(Node *root) {
+static int parity_fix(Node *root) {
     /* traverse all leaves */
-    if (!root) return;
+    if (!root) return 0;
     /* collect leaves by traversal */
     Node **stack = NULL; size_t sz = 0, cap = 0;
     cap = 32; stack = malloc(cap * sizeof(Node*));
-    if (!stack) { fprintf(stderr, "memory allocation failure\n"); return; }
+    if (!stack) { fprintf(stderr, "memory allocation failure\n"); return 0; }
     stack[sz++] = root;
+    int inserted = 0;
     while (sz) {
         Node *n = stack[--sz];
         if (n->is_leaf) {
-            /* compute sum num_inverters along path from root (excluding root?) include root->num_inverters? We consider root implicit 1 and num_inverters recorded there as well. We define total_inverters = sum over nodes on path of num_inverters; currently root.num_inverters includes implicit driver (1). */
+            /* compute sum num_inverters along path from root */
             int sum = 0;
             Node *p = n;
             while (p) { sum += p->num_inverters; p = p->parent; }
-            /* total number of inverters along path is sum; we need total to be even -> sum %2 == 0 */
+            /* total number of inverters along path is sum; we need total to be even */
             if ((sum % 2) != 0) {
-                /* sum is odd -> total inverters odd -> leaf would be inverting. We need even -> insert one inverter at parent of leaf */
                 Node *par = n->parent;
-                if (par) par->num_inverters += 1;
-                else n->num_inverters += 1; /* if leaf is root (degenerate), insert here */
+                if (par) { par->num_inverters += 1; inserted += 1; }
+                else { n->num_inverters += 1; inserted += 1; }
             }
             continue;
         }
         if (n->right) {
             if (sz == cap) {
-                cap *= 2;
-                Node **tmp = realloc(stack, cap * sizeof(Node*));
-                if (!tmp) { free(stack); fprintf(stderr, "memory allocation failure\n"); return; }
-                stack = tmp;
+                size_t ncap = cap * 2;
+                Node **tmp = realloc(stack, ncap * sizeof(Node*));
+                if (!tmp) { free(stack); fprintf(stderr, "memory allocation failure\n"); return inserted; }
+                stack = tmp; cap = ncap;
             }
             stack[sz++] = n->right;
         }
         if (n->left) {
             if (sz == cap) {
-                cap *= 2;
-                Node **tmp = realloc(stack, cap * sizeof(Node*));
-                if (!tmp) { free(stack); fprintf(stderr, "memory allocation failure\n"); return; }
-                stack = tmp;
+                size_t ncap = cap * 2;
+                Node **tmp = realloc(stack, ncap * sizeof(Node*));
+                if (!tmp) { free(stack); fprintf(stderr, "memory allocation failure\n"); return inserted; }
+                stack = tmp; cap = ncap;
             }
             stack[sz++] = n->left;
         }
     }
     free(stack);
+    return inserted;
+}
+
+/* iterate greedy insertion + parity fix until no change in total inverter count */
+static int iterate_insertion_until_converged(Node *root, const Wire *wire, const Inverter *inv, double constraint) {
+    const int MAX_ITERS = 64;
+    for (int it = 0; it < MAX_ITERS; ++it) {
+        int before = count_total_inverters(root);
+        greedy_insert_inverters(root, wire, inv, constraint);
+        parity_fix(root);
+        int after = count_total_inverters(root);
+        if (after == before) return 0; /* converged */
+    }
+    return 1; /* reached iteration limit */
 }
 
 /* post-order print topology with inverter counts: internal nodes printed as (lenL lenR k)
