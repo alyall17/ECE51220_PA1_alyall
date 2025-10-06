@@ -99,25 +99,31 @@ static void compute_cprimes(Node *n, const Wire *wire, const Inverter *drv) {
     if (!n) return;
     compute_cprimes(n->left, wire, drv);
     compute_cprimes(n->right, wire, drv);
-    /* Under the alternative convention, place the entire edge capacitance
-     * Ce = wire->c * length onto the child node. Since children were
-     * already processed, we add Ce to their cprime and subtree_c here.
+    /* Half-edge capacitance allocation: each edge's Ce = wire->c * length
+     * contributes half to the parent node and half to the child node.
+     * Children were already processed, so add the child's half to its
+     * cprime/subtree, and add the parent's half to the current node's cp.
      */
+    double cp = 0.0;
     if (n->left) {
         double Ce_left = wire->c * n->wire_left;
-        n->left->cprime += Ce_left;
-        n->left->subtree_c += Ce_left;
+        double half = Ce_left * 0.5;
+        /* add half to child */
+        n->left->cprime += half;
+        n->left->subtree_c += half;
+        /* add half to current node */
+        cp += half;
     }
     if (n->right) {
         double Ce_right = wire->c * n->wire_right;
-        n->right->cprime += Ce_right;
-        n->right->subtree_c += Ce_right;
+        double half = Ce_right * 0.5;
+        n->right->cprime += half;
+        n->right->subtree_c += half;
+        cp += half;
     }
-
-    double cp = 0.0;
     if (n->is_leaf) cp += n->cap;
-    /* Do NOT lump driver Cout at root in this variant; driver Cout will
-     * be accounted for separately in the stage delay if needed.
+    /* Do NOT lump driver Cout into cprime here; we account for driver Cout
+     * explicitly when writing/elmore checks (ctx.inv_Cout used elsewhere).
      */
     n->cprime = cp;
     n->subtree_c = cp + (n->left ? n->left->subtree_c : 0.0) + (n->right ? n->right->subtree_c : 0.0);
@@ -564,7 +570,7 @@ int main(int argc, char **argv) {
     set_Rroot_recursive(root, &wire);
 
     struct cb_ctx ctx;
-    ctx.fel = fel; ctx.root = root; ctx.wire = &wire; ctx.Rb = Rb; ctx.all_nodes = all; ctx.all_count = cnt;
+    ctx.fel = fel; ctx.root = root; ctx.wire = &wire; ctx.Rb = Rb; ctx.inv_Cout = inv.Cout; ctx.all_nodes = all; ctx.all_count = cnt;
     preorder_leaves(root, leaf_writer, &ctx);
     free(all);
     fclose(fel);
