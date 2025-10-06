@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <sys/time.h>
 
 // Node of strictly-binary RC tree. Matches the student's plan.
 typedef struct Node {
@@ -71,6 +72,9 @@ static void free_tree(Node *n) {
 // compute c' and subtree sums in post-order (half-edge allocation)
 static void computeCPrimes(Node *n, const Wire *wire, const Inverter *drv) {
     if (!n) return;
+    // reset cached values to avoid accumulation if this is called multiple times
+    n->cPrime = 0.0;
+    n->subtreeC = 0.0;
     computeCPrimes(n->left, wire, drv);
     computeCPrimes(n->right, wire, drv);
     // Half-edge capacitance allocation: each edge's Ce = wire->c * length
@@ -247,15 +251,7 @@ static void setRRootRecursive(Node *n, const Wire *wire) {
     }
 }
 
-// find first child of ancestor "from" on the path to node "to"
-static Node *firstChildOnPath(Node *from, Node *to) {
-    // walk up from 'to' to find the node whose parent is 'from'
-    Node *p = to;
-    Node *prev = NULL;
-    while (p && p != from) { prev = p; p = p->parent; }
-    if (p == from) return prev; // prev is immediate child of from on path
-    return NULL;
-}
+
 
 // Compute Elmore delays from driver node "drv_node" to every leaf in its subtree.
 // Returns max delay and sets worst_leaf_out. Uses inv params and wire.
@@ -312,7 +308,21 @@ static double elmoreFromDriver(Node *drv_node, const Wire *wire, const Inverter 
 
 // Greedy inverter insertion top-down: insert inverter at offending child of driver until all stage delays <= constraint.
 // This places inverters at existing internal nodes (no wire splitting). It increments num_inverters at a node when inserting.
-static int greedyInsertInverters(Node *root, const Wire *wire, const Inverter *inv, double constraint) {
+// forward declaration: compute worst delay across drivers (defined later)
+static double computeWorstDelayAndLabel(Node *root, const Wire *wire, const Inverter *inv, int *worstLabelOut);
+
+// add (or remove when dC is negative) capacitance to node->cPrime and propagate to all ancestors' subtreeC
+static void addCapToAncestors(Node *node, double dC) {
+    if (!node || dC == 0.0) return;
+    node->cPrime += dC;
+    Node *p = node;
+    while (p) {
+        p->subtreeC += dC;
+        p = p->parent;
+    }
+}
+
+static int greedyInsertInverters(Node *root, const Wire *wire, const Inverter *inv, double constraint, int debug) {
     // ensure root has one implicit driver
     if (root->numInverters == 0) root->numInverters = 1;
 
@@ -327,23 +337,89 @@ static int greedyInsertInverters(Node *root, const Wire *wire, const Inverter *i
     for (size_t di = 0; di < dcnt; ++di) {
         Node *drv = drivers[di];
         Node *worst = NULL;
-    double maxd = elmoreFromDriver(drv, wire, inv, &worst);
-        if (maxd <= constraint) continue;
-        // find child of drv on path to worst leaf
-    Node *child = firstChildOnPath(drv, worst);
-        if (!child) continue; // shouldn't happen
-        // insert one inverter at child (increase parallel count)
-    child->numInverters += 1;
-        inserted += 1;
-        // add child as a driver to be processed
-        if (dcnt == dcap) {
-            size_t ncap = dcap * 2;
-            Node **tmp = realloc(drivers, ncap * sizeof(Node*));
-            if (!tmp) { free(drivers); fprintf(stderr, "memory allocation failure\n"); return inserted; }
-            drivers = tmp; dcap = ncap;
+        double drvMax = elmoreFromDriver(drv, wire, inv, &worst);
+        if (drvMax <= constraint) continue;
+
+    // compute current global worst delay as baseline
+    int dummyLabel = -1;
+    double globalBefore = computeWorstDelayAndLabel(root, wire, inv, &dummyLabel);
+    // also compute driver's local Elmore before trials
+    Node *tmpWorst = NULL;
+    (void)elmoreFromDriver(drv, wire, inv, &tmpWorst);
+
+        // build path nodes from child of drv down to worst (inclusive)
+        // walk up from worst to drv (exclusive) and collect nodes
+        Node **path = NULL; size_t pcap = 0, psz = 0;
+        Node *p = worst;
+        while (p && p != drv) {
+            if (psz == pcap) {
+                pcap = pcap ? pcap * 2 : 16;
+                Node **tmp = realloc(path, pcap * sizeof(Node*));
+                if (!tmp) { free(path); free(drivers); fprintf(stderr, "memory allocation failure\n"); return inserted; }
+                path = tmp;
+            }
+            path[psz++] = p;
+            p = p->parent;
         }
-    drivers[dcnt++] = child;
-        // continue loop; the newly added driver will be processed later
+        if (psz == 0) { free(path); continue; }
+        // reverse order so candidates start near drv and go toward leaf
+        for (size_t i = 0; i < psz/2; ++i) {
+            Node *tmp = path[i]; path[i] = path[psz-1-i]; path[psz-1-i] = tmp;
+        }
+
+        // try each candidate on path: temporarily add 1 or 2 inverters (2-step lookahead)
+        double bestGlobal = globalBefore;
+        Node *bestCand = NULL;
+        int bestK = 0;
+        // configurable lookahead: default 4, can be overridden with PA1_LOOKAHEAD env var
+        int maxLookahead = 4;
+        char *lookEnv = getenv("PA1_LOOKAHEAD");
+        if (lookEnv && lookEnv[0] != '\0') {
+            int v = atoi(lookEnv);
+            if (v > 0) maxLookahead = v;
+        }
+        for (size_t pi = 0; pi < psz; ++pi) {
+            Node *cand = path[pi];
+            for (int ktry = 1; ktry <= maxLookahead; ++ktry) {
+                /* Apply temporary capacitance change for the trial: each inverter adds inv->Cin to the input node, and
+                 * placing k inverters in parallel multiplies that by k. We update cand->cPrime and propagate to
+                 * subtreeC for all ancestors so computeWorstDelayAndLabel and elmoreFromDriver see the change. */
+                double dC = inv->Cin * (double)ktry;
+                addCapToAncestors(cand, dC);
+                cand->numInverters += ktry;
+                double trialGlobal = computeWorstDelayAndLabel(root, wire, inv, NULL);
+                /* driver's local Elmore after this trial */
+                (void)elmoreFromDriver(drv, wire, inv, NULL);
+                /* revert temporary changes */
+                cand->numInverters -= ktry;
+                addCapToAncestors(cand, -dC);
+                if (trialGlobal < bestGlobal) {
+                    bestGlobal = trialGlobal;
+                    bestCand = cand;
+                    bestK = ktry;
+                }
+            }
+        }
+
+        if (bestCand && bestK > 0) {
+            // commit best candidate with bestK inverters -- apply capacitance permanently
+            double dCcommit = inv->Cin * (double)bestK;
+            addCapToAncestors(bestCand, dCcommit);
+            bestCand->numInverters += bestK;
+            inserted += bestK;
+            if (debug) fprintf(stderr, "  committed candidate ptr=%p (leaf=%d label=%d) k=%d newGlobal=%.12e\n", (void*)bestCand, bestCand->isLeaf, bestCand->isLeaf ? bestCand->label : -1, bestK, bestGlobal);
+            // add committed node as new driver to process later
+            if (dcnt == dcap) {
+                size_t ncap = dcap * 2;
+                Node **tmp = realloc(drivers, ncap * sizeof(Node*));
+                if (!tmp) { free(path); free(drivers); fprintf(stderr, "memory allocation failure\n"); return inserted; }
+                drivers = tmp; dcap = ncap;
+            }
+            drivers[dcnt++] = bestCand;
+        } else {
+            if (debug) fprintf(stderr, "  no candidate reduced global worst (bestGlobal=%.12e, globalBefore=%.12e)\n", bestGlobal, globalBefore);
+        }
+        free(path);
     }
     free(drivers);
     return inserted;
@@ -371,8 +447,13 @@ static int parityFix(Node *root) {
             // total number of inverters along path is sum, need total to be even
             if ((sum % 2) != 0) {
                 Node *par = n->parent;
-                if (par) { par->numInverters += 1; inserted += 1; }
-                else { n->numInverters += 1; inserted += 1; }
+                if (par) {
+                    /* Only increment if this will change the parent's parity (avoid repeated increments)
+                     * i.e., only add one inverter if parent's count is currently even. */
+                    if ((par->numInverters % 2) == 0) { par->numInverters += 1; inserted += 1; }
+                } else {
+                    if ((n->numInverters % 2) == 0) { n->numInverters += 1; inserted += 1; }
+                }
             }
             continue;
         }
@@ -399,17 +480,77 @@ static int parityFix(Node *root) {
     return inserted;
 }
 
+// compute the worst Elmore delay across all current drivers (nodes with numInverters>0)
+static double computeWorstDelayAndLabel(Node *root, const Wire *wire, const Inverter *inv, int *worstLabelOut) {
+    double maxd = -1.0;
+    int worstLabel = -1;
+    size_t alloc = 0, cnt = 0;
+    Node **arr = NULL;
+    collectNodesPre(&arr, &cnt, &alloc, root);
+    for (size_t i = 0; i < cnt; ++i) {
+        Node *n = arr[i];
+        if (n->numInverters > 0) {
+            Node *worstLeaf = NULL;
+            double d = elmoreFromDriver(n, wire, inv, &worstLeaf);
+            if (d > maxd) {
+                maxd = d;
+                worstLabel = worstLeaf ? worstLeaf->label : -1;
+            }
+        }
+    }
+    free(arr);
+    if (worstLabelOut) *worstLabelOut = worstLabel;
+    return maxd;
+}
+
 // iterate greedy insertion + parity fix until no change in total inverter count
-static int iterateInsertionUntilConverged(Node *root, const Wire *wire, const Inverter *inv, double constraint) {
-    const int MAX_ITERS = 64;
-    for (int it = 0; it < MAX_ITERS; ++it) {
+// debug: if non-zero, print per-iteration diagnostics to stderr
+static int iterateInsertionUntilConverged(Node *root, const Wire *wire, const Inverter *inv, double constraint, int debug) {
+    int it = 0;
+    int noImproveLimit = 50; // default no-improve iterations
+    char *envNo = getenv("PA1_NO_IMPROVE_ITERS");
+    if (envNo && envNo[0] != '\0') { int v = atoi(envNo); if (v > 0) noImproveLimit = v; }
+    int noImproveCounter = 0;
+    double bestWorst = 1e300;
+    // wall-clock timeout (seconds)
+    int timeoutSecs = 360; // default 6 minutes
+    char *envT = getenv("PA1_TIMEOUT");
+    if (envT && envT[0] != '\0') { int v = atoi(envT); if (v > 0) timeoutSecs = v; }
+    double t0 = 0.0;
+    // get current time
+    struct timeval tv0; gettimeofday(&tv0, NULL); t0 = (double)tv0.tv_sec + (double)tv0.tv_usec * 1e-6;
+
+    while (1) {
         int before = countTotalInverters(root);
-        greedyInsertInverters(root, wire, inv, constraint);
+        greedyInsertInverters(root, wire, inv, constraint, debug);
         parityFix(root);
         int after = countTotalInverters(root);
+        int worstLabel = -1;
+        double worstDelay = computeWorstDelayAndLabel(root, wire, inv, &worstLabel);
+        if (debug) {
+            fprintf(stderr, "iter %d: totalInverters before=%d after=%d worstDelay=%.12e worstLeaf=%d\n", it, before, after, worstDelay, worstLabel);
+        }
+        // handle improvement tracking
+        if (worstDelay < bestWorst - 1e-18) {
+            bestWorst = worstDelay;
+            noImproveCounter = 0;
+        } else {
+            noImproveCounter++;
+        }
+        // check no-improve stop
+        if (noImproveCounter >= noImproveLimit) {
+            if (debug) fprintf(stderr, "stopping: no improvement for %d iterations\n", noImproveCounter);
+            return 0;
+        }
+        // check timeout
+        struct timeval tv; gettimeofday(&tv, NULL); double now = (double)tv.tv_sec + (double)tv.tv_usec * 1e-6;
+        if (now - t0 > (double)timeoutSecs) {
+            fprintf(stderr, "stopping: timeout after %.0f seconds\n", now - t0);
+            return 1;
+        }
         if (after == before) return 0; // converged
+        ++it;
     }
-    return 1; // reached iteration limit
 }
 
 // post-order print topology with inverter counts: internal nodes printed as (lenL lenR k)
@@ -494,7 +635,12 @@ int main(int argc, char **argv) {
             if (sscanf(s, "%d(%lf)", &label, &cap) == 2) {
                 Node *n = make_leaf(label, cap);
                 if (!n) { fclose(treeFile); return EXIT_FAILURE; }
-                if (stackSz == stackCap) { stackCap = stackCap ? stackCap*2 : 16; parseStack = realloc(parseStack, stackCap * sizeof(Node*)); }
+                if (stackSz == stackCap) {
+                    size_t newCap = stackCap ? stackCap*2 : 16;
+                    Node **tmp = realloc(parseStack, newCap * sizeof(Node*));
+                    if (!tmp) { fprintf(stderr, "memory allocation failure\n"); fclose(treeFile); return EXIT_FAILURE; }
+                    parseStack = tmp; stackCap = newCap;
+                }
                 parseStack[stackSz++] = n;
                 continue;
             }
@@ -508,7 +654,12 @@ int main(int argc, char **argv) {
             Node *left = parseStack[--stackSz];
             Node *n = make_internal(left, right, l, r);
             if (!n) { fclose(treeFile); return EXIT_FAILURE; }
-            if (stackSz == stackCap) { stackCap = stackCap ? stackCap*2 : 16; parseStack = realloc(parseStack, stackCap * sizeof(Node*)); }
+            if (stackSz == stackCap) {
+                size_t newCap = stackCap ? stackCap*2 : 16;
+                Node **tmp = realloc(parseStack, newCap * sizeof(Node*));
+                if (!tmp) { fprintf(stderr, "memory allocation failure\n"); fclose(treeFile); return EXIT_FAILURE; }
+                parseStack = tmp; stackCap = newCap;
+            }
             parseStack[stackSz++] = n;
             continue;
         }
@@ -569,7 +720,10 @@ int main(int argc, char **argv) {
     fclose(elmoreFile);
 
     // Now perform inverter insertion (greedy + parity) iteratively until convergence
-    int iter_result = iterateInsertionUntilConverged(root, &wire, &inv, time_constraint);
+    int debug = 0;
+    char *dbg = getenv("PA1_DEBUG");
+    if (dbg && dbg[0] != '\0') debug = 1;
+    int iter_result = iterateInsertionUntilConverged(root, &wire, &inv, time_constraint, debug);
     if (iter_result) fprintf(stderr, "warning: inverter insertion reached iteration limit before converging\n");
 
     // Write post-order topology text and binary files

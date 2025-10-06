@@ -1,0 +1,16 @@
+  driver 0x12ef10a00: localDrvMax=7.061002516109e-09 drvLocalBefore=7.061002516109e-09 globalBefore=7.061002516109e-09 worstLeaf=244
+    candidate 0: internal ptr=0x12ef109a0 k=1 trialGlobal=7.061002516109e-09 drvLocalAfter=7.061002516109e-09
+    candidate 1: internal ptr=0x12ef0cb60 k=1 trialGlobal=7.061002516109e-09 drvLocalAfter=7.061002516109e-09
+    candidate 2: internal ptr=0x12ef0cb00 k=1 trialGlobal=7.061002516109e-09 drvLocalAfter=7.061002516109e-09
+    candidate 3: internal ptr=0x12ef0caa0 k=1 trialGlobal=7.061002516109e-09 drvLocalAfter=7.061002516109e-09
+    candidate 4: leaf label=244 ptr=0x12ef0ca40 k=1 trialGlobal=7.061002516109e-09 drvLocalAfter=7.061002516109e-09
+  no candidate reduced global worst (bestGlobal=7.061002516109e-09, globalBefore=7.061002516109e-09)
+iter 0: totalInverters before=0 after=147 worstDelay=7.061002516109e-09 worstLeaf=244
+  driver 0x12ef10a00: localDrvMax=7.061002516109e-09 drvLocalBefore=7.061002516109e-09 globalBefore=7.061002516109e-09 worstLeaf=244
+    candidate 0: internal ptr=0x12ef109a0 k=1 trialGlobal=7.061002516109e-09 drvLocalAfter=7.061002516109e-09
+    candidate 1: internal ptr=0x12ef0cb60 k=1 trialGlobal=7.061002516109e-09 drvLocalAfter=7.061002516109e-09
+    candidate 2: internal ptr=0x12ef0cb00 k=1 trialGlobal=7.061002516109e-09 drvLocalAfter=7.061002516109e-09
+    candidate 3: internal ptr=0x12ef0caa0 k=1 trialGlobal=7.061002516109e-09 drvLocalAfter=7.061002516109e-09
+    candidate 4: leaf label=244 ptr=0x12ef0ca40 k=1 trialGlobal=7.061002516109e-09 drvLocalAfter=7.061002516109e-09
+  no candidate reduced global worst (bestGlobal=7.061002516109e-09, globalBefore=7.061002516109e-09)
+iter 1: totalInverters before=147 after=147 worstDelay=7.061002516109e-09 worstLeaf=244
