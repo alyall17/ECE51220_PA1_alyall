@@ -381,16 +381,16 @@ static int greedyInsertInverters(Node *root, const Wire *wire, const Inverter *i
         for (size_t pi = 0; pi < psz; ++pi) {
             Node *cand = path[pi];
             for (int ktry = 1; ktry <= maxLookahead; ++ktry) {
-                /* Apply temporary capacitance change for the trial: each inverter adds inv->Cin to the input node, and
-                 * placing k inverters in parallel multiplies that by k. We update cand->cPrime and propagate to
-                 * subtreeC for all ancestors so computeWorstDelayAndLabel and elmoreFromDriver see the change. */
+                // Apply temporary capacitance change for the trial: each inverter adds inv->Cin to the input node, and
+                // placing k inverters in parallel multiplies that by k. We update cand->cPrime and propagate to
+                // subtreeC for all ancestors so computeWorstDelayAndLabel and elmoreFromDriver see the change.
                 double dC = inv->Cin * (double)ktry;
                 addCapToAncestors(cand, dC);
                 cand->numInverters += ktry;
                 double trialGlobal = computeWorstDelayAndLabel(root, wire, inv, NULL);
-                /* driver's local Elmore after this trial */
+                // driver's local Elmore after this trial
                 (void)elmoreFromDriver(drv, wire, inv, NULL);
-                /* revert temporary changes */
+                // revert temporary changes
                 cand->numInverters -= ktry;
                 addCapToAncestors(cand, -dC);
                 if (trialGlobal < bestGlobal) {
@@ -448,8 +448,8 @@ static int parityFix(Node *root) {
             if ((sum % 2) != 0) {
                 Node *par = n->parent;
                 if (par) {
-                    /* Only increment if this will change the parent's parity (avoid repeated increments)
-                     * i.e., only add one inverter if parent's count is currently even. */
+                    // Only increment if this will change the parent's parity (avoid repeated increments)
+                    // i.e., only add one inverter if parent's count is currently even.
                     if ((par->numInverters % 2) == 0) { par->numInverters += 1; inserted += 1; }
                 } else {
                     if ((n->numInverters % 2) == 0) { n->numInverters += 1; inserted += 1; }
