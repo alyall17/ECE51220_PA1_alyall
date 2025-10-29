@@ -1,0 +1,10 @@
+pa1.c:120:12: warning: function 'addPathContributions' is not needed and will not be emitted [-Wunneeded-internal-declaration]
+  120 | static int addPathContributions(Node *n, Node *target, const Wire *wire, double *accum) {
+      |            ^~~~~~~~~~~~~~~~~~~~
+pa1.c:142:13: warning: function 'preorderLeaves' is not needed and will not be emitted [-Wunneeded-internal-declaration]
+  142 | static void preorderLeaves(Node *n, leaf_cb cb, void *ctx) {
+      |             ^~~~~~~~~~~~~~
+pa1.c:203:13: warning: unused function 'leafWriter' [-Wunused-function]
+  203 | static void leafWriter(Node *leaf, void *vctx) {
+      |             ^~~~~~~~~~
+3 warnings generated.

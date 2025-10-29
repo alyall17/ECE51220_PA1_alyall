@@ -72,6 +72,7 @@ static void free_tree(Node *n) {
 // compute c' and subtree sums in post-order (half-edge allocation)
 static void computeCPrimes(Node *n, const Wire *wire, const Inverter *drv) {
     if (!n) return;
+    (void)drv; // drv parameter not used here but kept for API compatibility
     // reset cached values to avoid accumulation if this is called multiple times
     n->cPrime = 0.0;
     n->subtreeC = 0.0;
@@ -117,39 +118,6 @@ static void computeCPrimes(Node *n, const Wire *wire, const Inverter *drv) {
 // Add edge contributions R(u,v) * sum_{k in T_v} c'_k for each edge on the
 // path from root to target. This recursively searches for target and when
 // unwinding adds the child's subtree capacitance times the edge resistance.
-static int addPathContributions(Node *n, Node *target, const Wire *wire, double *accum) {
-    if (!n) return 0;
-    if (n == target) return 1;
-    if (n->left) {
-        if (addPathContributions(n->left, target, wire, accum)) {
-            double Redge = wire->r * n->wireLeft;
-            *accum += Redge * n->left->subtreeC;
-            return 1;
-        }
-    }
-    if (n->right) {
-        if (addPathContributions(n->right, target, wire, accum)) {
-            double Redge = wire->r * n->wireRight;
-            *accum += Redge * n->right->subtreeC;
-            return 1;
-        }
-    }
-    return 0;
-}
-
-// find all leaves in pre-order and perform action via callback
-typedef void (*leaf_cb)(Node *leaf, void *ctx);
-static void preorderLeaves(Node *n, leaf_cb cb, void *ctx) {
-    if (!n) return;
-    if (n->isLeaf) {
-        cb(n, ctx);
-        return;
-    }
-    // internal: visit node (no-op for leaves), then left then right
-    if (n->left) preorderLeaves(n->left, cb, ctx);
-    if (n->right) preorderLeaves(n->right, cb, ctx);
-}
-
 // write pre-order topology to text file
 // Write pre-order topology: matches output #1 format (Step 5).
 // Internal nodes: "(lenLeft lenRight)"; Leaf: "label(cap)" per line.
@@ -163,80 +131,8 @@ static void writePreorderTopology(FILE *f, Node *n) {
     writePreorderTopology(f, n->left);
     writePreorderTopology(f, n->right);
 }
-
-// context for leaf writer
-struct cb_ctx { FILE *fel; Node *root; const Wire *wire; double Rb; double inv_Cout; Node **all_nodes; size_t all_count; };
-
-// helper: compute LCA by walking ancestors of a and marking in an array
-// We implement a simple path-based LCA without extra memory by building
-// the ancestor list of a and then walking up from b.
-static Node *lca(Node *a, Node *b) {
-    if (!a || !b) return NULL;
-    // build ancestor list for a
-    Node *cur = a;
-    size_t cap = 64;
-    size_t sz = 0;
-    Node **anc = malloc(cap * sizeof(Node*));
-    if (!anc) { fprintf(stderr, "memory allocation failure\n"); return NULL; }
-    while (cur) {
-        if (sz == cap) {
-            size_t newCap = cap * 2;
-            Node **tmp = realloc(anc, newCap * sizeof(Node*));
-            if (!tmp) { free(anc); fprintf(stderr, "memory allocation failure\n"); return NULL; }
-            anc = tmp; cap = newCap;
-        }
-        anc[sz++] = cur;
-        cur = cur->parent;
-    }
-    // walk up from b and return first node that appears in anc
-    Node *res = NULL;
-    Node *p = b;
-    while (p) {
-        for (size_t i = 0; i < sz; ++i) if (anc[i] == p) { res = p; break; }
-        if (res) break;
-        p = p->parent;
-    }
-    free(anc);
-    return res;
-}
-
-static void leafWriter(Node *leaf, void *vctx) {
-    struct cb_ctx *c = (struct cb_ctx*)vctx;
-    double delay = 0.0;
-    // First-formula: sum over all nodes i of c'_i * Rcommon(i, leaf)
-    // where Rcommon(i,leaf) = Rroot(LCA(i,leaf)).
-    for (size_t k = 0; k < c->all_count; ++k) {
-        Node *i = c->all_nodes[k];
-        double ci = i->cPrime;
-        if (ci == 0.0) continue;
-        Node *L = lca(i, leaf);
-        if (!L) continue;
-        delay += ci * L->rRoot;
-    }
-    // include driver's output capacitance at the root as an extra c' term
-    // multiplied by Rroot(root). Treat the driver as having at least one
-    // stage (implicit) when computing effective Cout for the pre-output.
-    double root_k = (double)(c->root->numInverters ? c->root->numInverters : 1);
-    double Cout_eff = c->inv_Cout * root_k;
-    delay += Cout_eff * c->root->rRoot;
-    // write label (int) then double
-    fwrite(&leaf->label, sizeof(int), 1, c->fel);
-    fwrite(&delay, sizeof(double), 1, c->fel);
-}
-
-// collect nodes in pre-order into dynamic array *allp; *cntp and *allocp are updated
-static void collectNodesPre(Node ***allp, size_t *cntp, size_t *allocp, Node *n) {
-    if (!n) return;
-    if (*cntp == *allocp) {
-        *allocp = (*allocp == 0) ? 64 : (*allocp * 2);
-        Node **tmp = realloc(*allp, (*allocp) * sizeof(Node*));
-        if (!tmp) { fprintf(stderr, "memory allocation failure\n"); exit(EXIT_FAILURE); }
-        *allp = tmp;
-    }
-    (*allp)[(*cntp)++] = n;
-    collectNodesPre(allp, cntp, allocp, n->left);
-    collectNodesPre(allp, cntp, allocp, n->right);
-}
+/* collectNodesPre removed: computeWorstDelayAndLabel now traverses tree iteratively
+   so a separate node array is not required. */
 
 // set Rroot for node and all descendants (Rroot at root should be set before calling)
 static void setRRootRecursive(Node *n, const Wire *wire) {
@@ -253,57 +149,116 @@ static void setRRootRecursive(Node *n, const Wire *wire) {
 
 
 
+// Shared stack buffer used by elmoreFromDriver to avoid repeated malloc/realloc/free.
+// This is a simple, single-threaded optimization to reduce allocator churn.
+typedef struct { Node *n; double accum; } StackEntry;
+static StackEntry *elmore_shared_stack = NULL;
+static size_t elmore_shared_cap = 0;
+
 // Compute Elmore delays from driver node "drv_node" to every leaf in its subtree.
 // Returns max delay and sets worst_leaf_out. Uses inv params and wire.
 static double elmoreFromDriver(Node *drv_node, const Wire *wire, const Inverter *inv, Node **worst_leaf_out) {
     double max_delay = -1.0;
     Node *worst = NULL;
-    // determine effective Rb and Cout at this driver based on num_inverters
-    int k = drv_node->numInverters > 0 ? drv_node->numInverters : 1; // at least 1 when used as driver
+    if (!drv_node) { if (worst_leaf_out) *worst_leaf_out = NULL; return -1.0; }
+    int k = drv_node->numInverters > 0 ? drv_node->numInverters : 1;
     double Rb_eff = inv->Rb / (double)k;
     double Cout_eff = inv->Cout * (double)k;
-
-    // driver_total_cap is drv_node->subtree_c plus driver output cap
     double driver_total_c = drv_node->subtreeC + Cout_eff;
 
-    // For each leaf in subtree, compute delay = Rb_eff * driver_total_c + sum_edges Redge * subtree_c(child)
-    // traverse subtree and collect leaves
-    // simple stack traversal
-    Node **stack = NULL; size_t sz = 0, cap = 0;
-    //push drv_node
-    cap = 16; stack = malloc(cap * sizeof(Node*)); stack[sz++] = drv_node;
-    if (!stack) { fprintf(stderr, "memory allocation failure\n"); return -1.0; }
+    // ensure shared stack is allocated
+    if (elmore_shared_cap == 0) {
+        elmore_shared_cap = 256;
+        elmore_shared_stack = malloc(elmore_shared_cap * sizeof(StackEntry));
+        if (!elmore_shared_stack) { fprintf(stderr, "memory allocation failure\n"); return -1.0; }
+    }
+    size_t sz = 0;
+    double base = Rb_eff * driver_total_c;
+    // push root
+    elmore_shared_stack[sz++] = (StackEntry){ drv_node, base };
     while (sz) {
-        Node *n = stack[--sz];
+        StackEntry e = elmore_shared_stack[--sz];
+        Node *n = e.n;
+        double accum = e.accum;
         if (n->isLeaf) {
-            double delay = Rb_eff * driver_total_c;
-            // add edge contributions along path from drv_node to this leaf
-            addPathContributions(drv_node, n, wire, &delay);
+            double delay = accum;
             if (delay > max_delay) { max_delay = delay; worst = n; }
             continue;
         }
         if (n->right) {
-            if (sz == cap) {
-                cap *= 2;
-                Node **tmp = realloc(stack, cap * sizeof(Node*));
-                if (!tmp) { free(stack); fprintf(stderr, "memory allocation failure\n"); return -1.0; }
-                stack = tmp;
+            double add = wire->r * n->wireRight * n->right->subtreeC;
+            if (sz == elmore_shared_cap) {
+                size_t newcap = elmore_shared_cap * 2;
+                StackEntry *tmp = realloc(elmore_shared_stack, newcap * sizeof(StackEntry));
+                if (!tmp) { fprintf(stderr, "memory allocation failure\n"); return max_delay; }
+                elmore_shared_stack = tmp; elmore_shared_cap = newcap;
             }
-            stack[sz++] = n->right;
+            elmore_shared_stack[sz++] = (StackEntry){ n->right, accum + add };
         }
         if (n->left) {
-            if (sz == cap) {
-                cap *= 2;
-                Node **tmp = realloc(stack, cap * sizeof(Node*));
-                if (!tmp) { free(stack); fprintf(stderr, "memory allocation failure\n"); return -1.0; }
-                stack = tmp;
+            double add = wire->r * n->wireLeft * n->left->subtreeC;
+            if (sz == elmore_shared_cap) {
+                size_t newcap = elmore_shared_cap * 2;
+                StackEntry *tmp = realloc(elmore_shared_stack, newcap * sizeof(StackEntry));
+                if (!tmp) { fprintf(stderr, "memory allocation failure\n"); return max_delay; }
+                elmore_shared_stack = tmp; elmore_shared_cap = newcap;
             }
-            stack[sz++] = n->left;
+            elmore_shared_stack[sz++] = (StackEntry){ n->left, accum + add };
         }
     }
-    free(stack);
     if (worst_leaf_out) *worst_leaf_out = worst;
     return max_delay;
+}
+
+// Write binary elmore file for leaves in preorder by traversing the tree once from the root
+// Reuse the file-scoped elmore_shared_stack buffer to avoid extra allocations.
+static void writeElmoreFile(FILE *f, Node *root, const Wire *wire, const Inverter *inv) {
+    if (!f || !root) return;
+    int k = root->numInverters > 0 ? root->numInverters : 1;
+    double Rb_eff = inv->Rb / (double)k;
+    double Cout_eff = inv->Cout * (double)k;
+    double driver_total_c = root->subtreeC + Cout_eff;
+
+    // ensure shared stack is allocated
+    if (elmore_shared_cap == 0) {
+        elmore_shared_cap = 256;
+        elmore_shared_stack = malloc(elmore_shared_cap * sizeof(StackEntry));
+        if (!elmore_shared_stack) { fprintf(stderr, "memory allocation failure\n"); return; }
+    }
+    size_t sz = 0;
+    double base = Rb_eff * driver_total_c;
+    elmore_shared_stack[sz++] = (StackEntry){ root, base };
+    while (sz) {
+        StackEntry e = elmore_shared_stack[--sz];
+        Node *n = e.n; double accum = e.accum;
+        if (n->isLeaf) {
+            int lab = n->label; double delay = accum;
+            fwrite(&lab, sizeof(int), 1, f);
+            fwrite(&delay, sizeof(double), 1, f);
+            continue;
+        }
+        // push right then left so left visited before right
+        if (n->right) {
+            double add = wire->r * n->wireRight * n->right->subtreeC;
+            if (sz == elmore_shared_cap) {
+                size_t newcap = elmore_shared_cap * 2;
+                StackEntry *tmp = realloc(elmore_shared_stack, newcap * sizeof(StackEntry));
+                if (!tmp) { fprintf(stderr, "memory allocation failure\n"); return; }
+                elmore_shared_stack = tmp; elmore_shared_cap = newcap;
+            }
+            elmore_shared_stack[sz++] = (StackEntry){ n->right, accum + add };
+        }
+        if (n->left) {
+            double add = wire->r * n->wireLeft * n->left->subtreeC;
+            if (sz == elmore_shared_cap) {
+                size_t newcap = elmore_shared_cap * 2;
+                StackEntry *tmp = realloc(elmore_shared_stack, newcap * sizeof(StackEntry));
+                if (!tmp) { fprintf(stderr, "memory allocation failure\n"); return; }
+                elmore_shared_stack = tmp; elmore_shared_cap = newcap;
+            }
+            elmore_shared_stack[sz++] = (StackEntry){ n->left, accum + add };
+        }
+    }
 }
 
 // Greedy inverter insertion top-down: insert inverter at offending child of driver until all stage delays <= constraint.
@@ -344,8 +299,7 @@ static int greedyInsertInverters(Node *root, const Wire *wire, const Inverter *i
     int dummyLabel = -1;
     double globalBefore = computeWorstDelayAndLabel(root, wire, inv, &dummyLabel);
     // also compute driver's local Elmore before trials
-    Node *tmpWorst = NULL;
-    (void)elmoreFromDriver(drv, wire, inv, &tmpWorst);
+    /* driver's local elmore recomputation not needed here (we recompute global baseline) */
 
         // build path nodes from child of drv down to worst (inclusive)
         // walk up from worst to drv (exclusive) and collect nodes
@@ -484,11 +438,14 @@ static int parityFix(Node *root) {
 static double computeWorstDelayAndLabel(Node *root, const Wire *wire, const Inverter *inv, int *worstLabelOut) {
     double maxd = -1.0;
     int worstLabel = -1;
-    size_t alloc = 0, cnt = 0;
-    Node **arr = NULL;
-    collectNodesPre(&arr, &cnt, &alloc, root);
-    for (size_t i = 0; i < cnt; ++i) {
-        Node *n = arr[i];
+    if (!root) { if (worstLabelOut) *worstLabelOut = -1; return -1.0; }
+    // iterative pre-order stack traversal to avoid allocating a node array each call
+    size_t cap = 64, sz = 0;
+    Node **stack = malloc(cap * sizeof(Node*));
+    if (!stack) { fprintf(stderr, "memory allocation failure\n"); return -1.0; }
+    stack[sz++] = root;
+    while (sz) {
+        Node *n = stack[--sz];
         if (n->numInverters > 0) {
             Node *worstLeaf = NULL;
             double d = elmoreFromDriver(n, wire, inv, &worstLeaf);
@@ -497,8 +454,16 @@ static double computeWorstDelayAndLabel(Node *root, const Wire *wire, const Inve
                 worstLabel = worstLeaf ? worstLeaf->label : -1;
             }
         }
+        if (n->right) {
+            if (sz == cap) { size_t ncap = cap * 2; Node **tmp = realloc(stack, ncap * sizeof(Node*)); if (!tmp) { free(stack); fprintf(stderr, "memory allocation failure\n"); return maxd; } stack = tmp; cap = ncap; }
+            stack[sz++] = n->right;
+        }
+        if (n->left) {
+            if (sz == cap) { size_t ncap = cap * 2; Node **tmp = realloc(stack, ncap * sizeof(Node*)); if (!tmp) { free(stack); fprintf(stderr, "memory allocation failure\n"); return maxd; } stack = tmp; cap = ncap; }
+            stack[sz++] = n->left;
+        }
     }
-    free(arr);
+    free(stack);
     if (worstLabelOut) *worstLabelOut = worstLabel;
     return maxd;
 }
@@ -663,10 +628,7 @@ int main(int argc, char **argv) {
             parseStack[stackSz++] = n;
             continue;
         }
-        // try alternative formats
-        if (sscanf(s, "%d ( %lf )", (int[]){0}, &l) == 0) {
-            // ignore
-        }
+        // no alternative formats supported; ignore unknown lines
     }
     fclose(treeFile);
 
@@ -702,21 +664,12 @@ int main(int argc, char **argv) {
 
     // Prepare nodes array and compute Rroot for each node (resistance from source to node).
     // Rroot at root should include driver Rb. We compute Rroot in a pre-order traversal.
-    // collect nodes into a dynamic array (pre-order) using helper
-    size_t allocNodes = 0, nodeCount = 0;
-    Node **allNodes = NULL;
-    collectNodesPre(&allNodes, &nodeCount, &allocNodes, root);
-
     // compute Rroot: resistance from source to node. Start from root (Rb included)
     // and propagate down adding edge resistances.
     root->rRoot = Rb; // source -> root includes driver Rb
-    // set rRoot for all nodes starting at root
     setRRootRecursive(root, &wire);
-
-    struct cb_ctx ctx;
-    ctx.fel = elmoreFile; ctx.root = root; ctx.wire = &wire; ctx.Rb = Rb; ctx.inv_Cout = inv.Cout; ctx.all_nodes = allNodes; ctx.all_count = nodeCount;
-    preorderLeaves(root, leafWriter, &ctx);
-    free(allNodes);
+    // write elmore delays for leaves efficiently (single traversal)
+    writeElmoreFile(elmoreFile, root, &wire, &inv);
     fclose(elmoreFile);
 
     // Now perform inverter insertion (greedy + parity) iteratively until convergence
