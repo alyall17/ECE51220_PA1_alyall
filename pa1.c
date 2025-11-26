@@ -686,12 +686,15 @@ int main(int argc, char **argv) {
         if (ftt) fclose(ftt);
         if (fbt) fclose(fbt);
         // leave them empty if we couldn't open
+        if (elmore_shared_stack) { free(elmore_shared_stack); elmore_shared_stack = NULL; elmore_shared_cap = 0; }
         free_tree(root);
         return EXIT_FAILURE;
     }
     writePostorderTopology(ftt, root);
     writePostorderTopologyBinary(fbt, root);
     fclose(ftt); fclose(fbt);
+
+    if (elmore_shared_stack) { free(elmore_shared_stack); elmore_shared_stack = NULL; elmore_shared_cap = 0; }
 
     free_tree(root);
     return EXIT_SUCCESS;
